@@ -126,6 +126,15 @@ async function load() {
   // Files added without a catalog entry
   const extra = await get('kv', 'extra') || [];
   for (const e of extra) if (!S.byId.has(e.id)) { S.items.push(e); S.byId.set(e.id, e); }
+  // Audio added before the catalog: build its entry from the file's own tags so it still shows up
+  const orphans = [...S.onPhone].filter(id => !S.byId.has(id));
+  if (orphans.length) {
+    for (const id of orphans) {
+      const rec = await get('audio', id);
+      if (rec) { const e = await entryFromFile(rec.blob, rec.name || '', id); extra.push(e); S.items.push(e); S.byId.set(id, e); }
+    }
+    await put('kv', extra, 'extra');
+  }
   if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
   if (last && S.onPhone.has(last)) await loadTrack(last, false);
   if (!inProgress().length) S.tab = 'library';  // nothing to resume: open on the Library
@@ -927,12 +936,10 @@ $('#file-in').addEventListener('change', async e => {
       }
       if (!/^audio\//.test(f.type) && !/\.(m4a|mp3|aac|wav|aiff?|ogg|opus)$/i.test(f.name)) { skipped++; continue; }
       let id = (f.name.match(/\[([0-9a-f]{8})\]/) || [])[1];
-      if (!id) {
-        id = 'x' + (await sha(f.name + f.size)).slice(0, 7);
-        if (!S.byId.has(id)) {
-          const e2 = { id, preacher: '[Unknown preacher]', series: '', part: null, title: f.name.replace(/\.[^.]+$/, ''), topic: 'Christian Living', path: f.name, size: f.size };
-          extra.push(e2); S.items.push(e2); S.byId.set(id, e2);
-        }
+      if (!id) id = 'x' + (await sha(f.name + f.size)).slice(0, 7);
+      if (!S.byId.has(id)) {  // not in the catalog (or no catalog yet): use the file's own tags
+        const e2 = await entryFromFile(f, f.name, id);
+        extra.push(e2); S.items.push(e2); S.byId.set(id, e2);
       }
       await put('audio', { blob: f, name: f.name, size: f.size, added: Date.now() }, id);
       S.onPhone.add(id); S.want.delete(id); added++;
@@ -943,6 +950,46 @@ $('#file-in').addEventListener('change', async e => {
   if (added) toast(`Added ${added} message${added === 1 ? '' : 's'} to your phone`);
   render();
 });
+// Title / preacher / series / type from an .m4a's tags (the Mac writes them), else from the file name.
+async function readTags(file) {
+  const out = {};
+  try {
+    const buf = async (a, b) => new DataView(await file.slice(a, b).arrayBuffer());
+    let pos = 0, moov = null;
+    while (pos + 8 <= file.size) {
+      const h = await buf(pos, pos + 16);
+      let size = h.getUint32(0); const type = String.fromCharCode(h.getUint8(4), h.getUint8(5), h.getUint8(6), h.getUint8(7));
+      let hdr = 8;
+      if (size === 1) { size = h.getUint32(8) * 2 ** 32 + h.getUint32(12); hdr = 16; }
+      if (size === 0) size = file.size - pos;
+      if (size < 8) break;
+      if (type === 'moov') { if (size < 8e6) moov = await buf(pos + hdr, pos + size); break; }
+      pos += size;
+    }
+    if (!moov) return out;
+    const dec = new TextDecoder();
+    const name = (d, o) => String.fromCharCode(d.getUint8(o + 4), d.getUint8(o + 5), d.getUint8(o + 6), d.getUint8(o + 7));
+    const kids = (d, a, b) => { const r = []; while (a + 8 <= b) { const sz = d.getUint32(a); if (sz < 8 || a + sz > b) break; r.push([name(d, a), a + 8, a + sz]); a += sz; } return r; };
+    const find = (list, t) => list.find(k => k[0] === t);
+    const udta = find(kids(moov, 0, moov.byteLength), 'udta'); if (!udta) return out;
+    const meta = find(kids(moov, udta[1], udta[2]), 'meta'); if (!meta) return out;
+    const ilst = find(kids(moov, meta[1] + 4, meta[2]), 'ilst'); if (!ilst) return out;
+    const map = { '\u00a9nam': 'title', '\u00a9ART': 'preacher', '\u00a9alb': 'series', '\u00a9gen': 'topic' };
+    for (const [t, a, b] of kids(moov, ilst[1], ilst[2])) {
+      const key = map[t]; if (!key) continue;
+      const data = find(kids(moov, a, b), 'data'); if (!data) continue;
+      out[key] = dec.decode(new Uint8Array(moov.buffer, moov.byteOffset + data[1] + 8, data[2] - data[1] - 8)).trim();
+    }
+  } catch (e) { console.warn('tags', e); }
+  return out;
+}
+async function entryFromFile(f, fname, id) {
+  const t = /\.(m4a|mp4|aac)$/i.test(fname) ? await readTags(f) : {};
+  const title = t.title || fname.replace(/\.[^.]+$/, '').replace(/\s*\[[0-9a-f]{8}\]\s*$/, '');
+  const pm = title.match(/part\s*(\d+)/i);
+  return { id, preacher: t.preacher || '[Unknown preacher]', series: t.series || '', part: pm ? +pm[1] : null, title,
+    topic: TOPICS.includes(t.topic) ? t.topic : 'Christian Living', path: fname, size: f.size };
+}
 async function sha(s) {
   const h = await crypto.subtle.digest('SHA-1', new TextEncoder().encode(s));
   return [...new Uint8Array(h)].map(b => b.toString(16).padStart(2, '0')).join('');
